@@ -2,6 +2,7 @@
 #include <Servo.h> // Disabled definition of timer 3
 #include <SerialCommand.h> // change to serial port 3
 #include <PID_v1.h>
+//#include <TMC2209.h> // Uses softserial which restricts cpu time. Should only use softserial in setup
 
 //#define DEBUG
 #define DEBUG_SERIAL
@@ -19,7 +20,9 @@ const uint8_t DIR_PIN = 55;
 const uint8_t TELEMETRY_FRAME_SIZE = 10;
 static uint8_t telemetryBuffer[TELEMETRY_FRAME_SIZE] = { 0, };
 uint8_t bufferPosition = 0;
-
+uint32_t motorRPM;
+//SoftwareSerial soft_serial(RX_PIN, TX_PIN);
+//TMC2209 stepper_driver;
 Servo esc;
 const int32_t MAX_STEP_VELOCITY = 210000;
 const int32_t STOP_VELOCITY = 0;
@@ -86,19 +89,21 @@ void setup() {
   //Home stepper motors
 }
 
-void loop()
-{
+void loop() {
+  cmd.readSerial();
   uint16_t val = analogRead(POT);
   analogWrite(FAN, map(val, 0, 1023, 0, 255)); // timer 2 is used for pwm
   
   while(Serial2.available()){
     telemetryBuffer[bufferPosition++] = Serial2.read();
+
     if(bufferPosition == TELEMETRY_FRAME_SIZE){
-      // feature: add crc data validation
       bufferPosition = 0;
       float eRevPerMin = (telemetryBuffer[7] << 8) | telemetryBuffer[8];
-      //To get the real Rpm of the motor, divide the Erpm by the magnetpole count divided by two.
+      //Note: To get the real Rpm of the motor, divide the Erpm by the magnetpole count divided by two.
       inRevPerMin = (eRevPerMin*100) / 11.0;
+      
+      // feature: add crc data validation
       #ifdef DEBUG
         // - Temperature (resolution 1°C)
         // - Voltage (resolution 0.01V)
@@ -109,14 +114,16 @@ void loop()
         //float motorVoltage = 0;
         //motorVoltage = (telemetryBuffer[2] << 8) | telemetryBuffer[1];
         //motorCurrent = (telemetryBuffer[3] << 8) | telemetryBuffer[4];
+        // Serial.print("Voltage(V):");
+        // Serial.println(motorVoltage,3);
+        // Serial.print("Current(A):");
+        // Serial.println(motorCurrent,3);
         Serial.print("RPM:");
         Serial.println(curRevPerMin);
       #endif
     }
   }
 
-  cmd.readSerial();
-  
   if(motorArmed){
     if(targetRevPerMin == inRevPerMin) motorArmed = false;
     motorPID.Compute();
@@ -125,24 +132,22 @@ void loop()
   }
 }
 
-ISR(TIMER3_COMPA_vect)
-{
+ISR(TIMER3_COMPA_vect){
+  curStepCount++;
   TCNT3 = 0;  
   OCR3A = reload * stepSpeed;
-
-  digitalWrite(STEP_PIN, HIGH);
-  digitalWrite(STEP_PIN, LOW);
-
-  if(curStepCount == targetStepCount){
+  if(stepSpeed < 4990){
+    digitalWrite(STEP_PIN, HIGH);
+    digitalWrite(STEP_PIN, LOW);
+  }
+  if(curStepCount > targetStepCount){
     digitalWrite(ENABLE_PIN, HIGH);
     curStepCount = 0;
-    TIMSK3 &= (0<<OCIE3A); //Disable timer 3 ISR
+    TIMSK3 |= (0<<OCIE3A);
   }
-  else curStepCount++;
 } //Timer 3 counter
 
-void moveStepper()
-{
+void moveStepper(){
   char* arg = cmd.next();
   char* garbage = NULL;
   if(arg != NULL){
@@ -158,12 +163,11 @@ void moveStepper()
       Serial.println(targetStepCount);
   #endif
   noInterrupts();
-  TIMSK3 |= (1<<OCIE3A); //Enable timer 3 ISR
+  TIMSK3 |= (1<<OCIE3A);
   interrupts();
 }
 
-void setMotorRPM()
-{
+void setMotorRPM(){
   char* arg = cmd.next();
   char* garbage = NULL;
   
@@ -173,13 +177,11 @@ void setMotorRPM()
   motorArmed = true;
 }
 
-void unknownCommand()
-{
+void unknownCommand(){
   Serial.println("Command not found");
 }
 
-uint8_t update_crc8(uint8_t crc, uint8_t crc_seed)
-{
+uint8_t update_crc8(uint8_t crc, uint8_t crc_seed){
   uint8_t crc_u, i;
   crc_u = crc;
   crc_u ^= crc_seed;
@@ -187,8 +189,7 @@ uint8_t update_crc8(uint8_t crc, uint8_t crc_seed)
   return (crc_u);
 }
 
-uint8_t get_crc8(uint8_t *Buf, uint8_t BufLen)
-{
+uint8_t get_crc8(uint8_t *Buf, uint8_t BufLen){
   uint8_t crc = 0, i;
   for( i=0; i<BufLen; i++) crc = update_crc8(Buf[i], crc);
   return (crc);
