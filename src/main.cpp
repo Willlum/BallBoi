@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include <Servo.h> // Disabled definition of timer 3
+#include <Servo.h> // Disabled definition of timer 3 & 4
 #include <SerialCommand.h> // change to serial port 3
 #include <PID_v1.h>
 
@@ -16,35 +16,36 @@ const uint8_t TX_PIN = 40;
 const uint8_t ENABLE_PIN = 38;
 const uint8_t STEP_PIN = 54;
 const uint8_t DIR_PIN = 55;
+
 const uint8_t TELEMETRY_FRAME_SIZE = 10;
 static uint8_t telemetryBuffer[TELEMETRY_FRAME_SIZE] = { 0, };
 uint8_t bufferPosition = 0;
-
 Servo esc;
-const int32_t MAX_STEP_VELOCITY = 210000;
-const int32_t STOP_VELOCITY = 0;
-const int RUN_DURATION = 2000;
-const int STOP_DURATION = 1000;
-const int RUN_COUNT = 4;
 
-uint16_t motorspeed;
-double inRevPerMin;
-double outRevPerMin;
-double targetRevPerMin;
-double Kp=2, Ki=5, Kd=1;
+uint16_t motorSpeed;
+double inRPM;
+double outRPM;
+double targetRPM;
+double Kp=1, Ki=1, Kd=1;
 bool motorArmed = false;
-PID motorPID(&inRevPerMin, &outRevPerMin, &targetRevPerMin, Kp, Ki, Kd, DIRECT);
-
-volatile uint32_t stepSpeed = 30;
+PID motorPID(&inRPM, &outRPM, &targetRPM, Kp, Ki, Kd, DIRECT);
+volatile uint32_t stepSpeed = 50;
 volatile uint32_t curStepCount = 0;
 volatile uint32_t targetStepCount = 0;
  /*
   System clock 16 Mhz and Prescalar 8
-  Timer 1 speed = 16Mhz/8 = 2 MHz    
-  Pulse time = 1/2 MHz  =  500ns
-  Count up to = 5us / 500ns = 10
+  Timer 3 speed = 16Mhz/8 = 2 MHz    
+  Pulse time = 1 / 2 MHz  =  500ns
+  Count up to = 5us / 500ns = 10 count
 */  
-volatile uint32_t reload = 10;
+volatile uint16_t timer3Reload = 10;
+ /*
+  System clock 16 Mhz and Prescalar 1024
+  Timer 3 speed = 16Mhz/1024 = 15625 Hz    
+  Pulse time = 1 / 15625 Hz = 64us 
+  Count up to = 0.5s / 64us = 7813 count
+*/  
+volatile uint16_t timer4Reload = 10;
 SerialCommand cmd;
 
 void unknownCommand(void);
@@ -55,16 +56,17 @@ void setup() {
   Serial.begin(115200);
   Serial2.begin(115200);
   
-  motorPID.SetMode(AUTOMATIC);
   motorPID.SetOutputLimits(0, 6500);
+  motorPID.SetSampleTime(500);
+  motorPID.SetMode(AUTOMATIC);
 
-  //esc.attach(MOTOR, MIN_SPEED, MAX_SPEED);
+  esc.attach(MOTOR, MIN_SPEED, MAX_SPEED);
   pinMode(MOTOR, OUTPUT);
   digitalWrite(FAN, HIGH);
   pinMode(FAN, OUTPUT);
   pinMode(POT, INPUT);
   pinMode(ENABLE_PIN, OUTPUT);
-  digitalWrite(ENABLE_PIN, HIGH);
+  digitalWrite(ENABLE_PIN, HIGH); //Enable is active low
   pinMode(STEP_PIN, OUTPUT);
   digitalWrite(STEP_PIN, LOW);
   pinMode(DIR_PIN, OUTPUT);
@@ -79,11 +81,22 @@ void setup() {
   TCCR3A = 0;
   TCCR3B = 0;
   TCCR3B |= (1<<CS31);
-  TIMSK3 |= (1<<OCIE3A);
-  OCR3A = reload;
+  TIMSK3 &= ~(1<<OCIE3A);
+  OCR3A = timer3Reload;
   interrupts();
+  //End Timer 3 
 
-  //Home stepper motors
+  // //Timer 4 configuration
+  // noInterrupts();
+  // OCR4A = timer4Reload;
+  // TCCR4A = 0;
+  // TCCR4B = 0;
+  // TCCR4B |= (1<<WGM12) | (1<<CS42);
+  // TIMSK4 &= ~(1<<OCIE4A);
+  // interrupts();
+  // //End Timer 4
+  
+  //Home stepper motors. We can use sensorless cal with T2209
 }
 
 void loop()
@@ -91,44 +104,40 @@ void loop()
   uint16_t val = analogRead(POT);
   analogWrite(FAN, map(val, 0, 1023, 0, 255)); // timer 2 is used for pwm
   
-  while(Serial2.available()){
-    telemetryBuffer[bufferPosition++] = Serial2.read();
-    if(bufferPosition == TELEMETRY_FRAME_SIZE){
-      // feature: add crc data validation
-      bufferPosition = 0;
-      float eRevPerMin = (telemetryBuffer[7] << 8) | telemetryBuffer[8];
-      //To get the real Rpm of the motor, divide the Erpm by the magnetpole count divided by two.
-      inRevPerMin = (eRevPerMin*100) / 11.0;
-      #ifdef DEBUG
-        // - Temperature (resolution 1°C)
-        // - Voltage (resolution 0.01V)
-        // - Current (resolution 0.01A)
-        // - Consumption (resolution 1mAh)
-        // - Electrical Rpm (resolution 100Rpm)
-        //float motorCurrent = 0;
-        //float motorVoltage = 0;
-        //motorVoltage = (telemetryBuffer[2] << 8) | telemetryBuffer[1];
-        //motorCurrent = (telemetryBuffer[3] << 8) | telemetryBuffer[4];
-        Serial.print("RPM:");
-        Serial.println(curRevPerMin);
-      #endif
+  if(Serial2.available()){
+    for(int8_t i; i<TELEMETRY_FRAME_SIZE; i++){
+      telemetryBuffer[bufferPosition++] = Serial2.read();
+      if(bufferPosition == TELEMETRY_FRAME_SIZE){
+        // feature: add crc data validation
+        bufferPosition = 0;
+        float eRevPerMin = (telemetryBuffer[7] << 8) | telemetryBuffer[8];
+        //To get the real Rpm of the motor, divide the Erpm by the magnetpole count divided by two.
+        inRPM = (eRevPerMin*100) / 11.0;
+        #ifdef DEBUG
+          // - Temperature (resolution 1°C)
+          // - Voltage (resolution 0.01V)
+          // - Current (resolution 0.01A)
+          // - Consumption (resolution 1mAh)
+          // - Electrical Rpm (resolution 100Rpm)
+          //float motorCurrent = 0;
+          //float motorVoltage = 0;
+          //motorVoltage = (telemetryBuffer[2] << 8) | telemetryBuffer[1];
+          //motorCurrent = (telemetryBuffer[3] << 8) | telemetryBuffer[4];
+          Serial.print("RPM:");
+          Serial.println(inRPM);
+        #endif
+      }
     }
   }
 
+
   cmd.readSerial();
-  
-  if(motorArmed){
-    if(targetRevPerMin == inRevPerMin) motorArmed = false;
-    motorPID.Compute();
-    motorspeed = map(outRevPerMin, 0, 6500, MIN_SPEED, MAX_SPEED);
-    esc.writeMicroseconds(motorspeed);
-  }
 }
 
 ISR(TIMER3_COMPA_vect)
 {
   TCNT3 = 0;  
-  OCR3A = reload * stepSpeed;
+  OCR3A = timer3Reload * stepSpeed;
 
   digitalWrite(STEP_PIN, HIGH);
   digitalWrite(STEP_PIN, LOW);
@@ -136,7 +145,9 @@ ISR(TIMER3_COMPA_vect)
   if(curStepCount == targetStepCount){
     digitalWrite(ENABLE_PIN, HIGH);
     curStepCount = 0;
-    TIMSK3 &= (0<<OCIE3A); //Disable timer 3 ISR
+    noInterrupts();           
+    TIMSK3 &= ~(1<<OCIE3A); //Disable timer 3 ISR
+    interrupts();
   }
   else curStepCount++;
 } //Timer 3 counter
@@ -152,15 +163,37 @@ void moveStepper()
     digitalWrite(ENABLE_PIN, LOW);
   }
   #ifdef DEBUG_SERIAL
-      Serial.print("Stepper count: ");
-      Serial.print(arg);
-      Serial.print(", ");
-      Serial.println(targetStepCount);
+    Serial.print("Stepper count: ");
+    Serial.print(arg);
+    Serial.print(", ");
+    Serial.println(targetStepCount);
   #endif
+
   noInterrupts();
   TIMSK3 |= (1<<OCIE3A); //Enable timer 3 ISR
   interrupts();
 }
+
+// ISR(TIMER4_COMPA_vect)
+// {
+//   OCR4A = timer4Reload; 
+//   if(targetRPM != inRPM){
+//     uint32_t temp = abs(inRPM - targetRPM);
+//     motorSpeed = map(temp, 0, 6500, MIN_SPEED, MAX_SPEED); 
+//     Serial.println(inRPM);
+//     esc.writeMicroseconds(motorSpeed);
+//   } 
+//   else if(targetRPM == 0){
+//     esc.writeMicroseconds(1000);
+//     motorArmed = false;
+//   }
+//   else{
+//     motorArmed = false;
+//     noInterrupts();           
+//     TIMSK4 &= ~(1<<OCIE4A); //Disable timer 4 ISR
+//     interrupts();
+//   }
+// }
 
 void setMotorRPM()
 {
@@ -168,9 +201,14 @@ void setMotorRPM()
   char* garbage = NULL;
   
   if(arg != NULL){
-    targetRevPerMin = (uint32_t) strtol(arg, &garbage,0);
+    targetRPM = (uint32_t) strtol(arg, &garbage,0);
+    //Serial.println(targetRevPerMin);
   }
   motorArmed = true;
+
+  noInterrupts();           
+  TIMSK4 |= (1<<OCIE4A); //Enable timer 4 ISR
+  interrupts();
 }
 
 void unknownCommand()
