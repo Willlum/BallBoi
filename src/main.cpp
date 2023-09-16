@@ -33,6 +33,7 @@ volatile uint16_t timer3Reload = 10;
   Count up to = 0.5s / 64us = 7813 count
 */  
 volatile uint32_t numSec;
+volatile uint8_t motorMaxSpeed = 128;
 volatile uint16_t timer4Reload = 7813;
 volatile uint8_t motorTurning = false;
 uint8_t motorIndex = 0;
@@ -72,13 +73,14 @@ Motor* motorArr[2];
 
 SerialCommand cmd;
 void unknownCommand(void);
-void setMotorRPM(void);
-void getMotorRPM(void);
-void rotateMotor(void);
 void moveStepper(void);
+void setMotorRPM(void);
+void rotateMotor(void);
+void setMotorSpeed(void);
+void getMotorRPM(void);
 
 void setup() {
-  Serial.begin(57600);
+  Serial.begin(56700);
   Serial1.begin(9600); //blutooth D18, D19
   pinMode(MOTOR1, OUTPUT);
   digitalWrite(FEED_MOTOR, LOW);
@@ -96,6 +98,7 @@ void setup() {
   cmd.addCommand("ms", getMotorRPM);
   cmd.addCommand("s", moveStepper);
   cmd.addCommand("rm", rotateMotor);
+  cmd.addCommand("sm",setMotorSpeed);
   cmd.addDefaultHandler(unknownCommand);
 
   //Timer 3 configuration
@@ -162,7 +165,7 @@ void loop()
     if(motorArr[motorIndex]->targetRPM == 0 and motorArr[motorIndex]->inRPM < 300){ //spin down motor
       motorArr[motorIndex]->esc->writeMicroseconds(Motor::MIN_SPEED);
       motorArr[motorIndex]->motorInstruction = false;
-      Serial.print("Set point reached");
+      Serial1.println("Motor off");
     }
     else if(motorArr[motorIndex]->inRPM != motorArr[motorIndex]->targetRPM){ 
       motorArr[motorIndex]->motorSpeed = map(motorArr[motorIndex]->outRPM, 1000, 6500, Motor::MIN_SPEED, Motor::MAX_SPEED); // Map current PID value to motor speed
@@ -170,7 +173,7 @@ void loop()
     }
     else { // inRPM == targetRPM
       motorArr[motorIndex]->motorInstruction = false;
-      Serial.print("Set point reached");
+      Serial1.println("Set point reached");
     } 
   }
 
@@ -203,7 +206,7 @@ ISR(TIMER4_COMPA_vect)
 
   if(motorTurning){
     OCR4A = timer3Reload * numSec;
-    analogWrite(FEED_MOTOR, 128); //Lower speed if time to rotate is < 1 sec
+    analogWrite(FEED_MOTOR, motorMaxSpeed); //Lower speed if time to rotate is < 1 sec
   }
   else{
     analogWrite(FEED_MOTOR, 0);
@@ -226,10 +229,10 @@ void moveStepper()
   }
 
   #ifdef DEBUG_SERIAL
-    Serial.print("Stepper count: ");
-    Serial.print(arg);
-    Serial.print(", ");
-    Serial.println(targetStepCount);
+    Serial1.print("Stepper count: ");
+    Serial1.print(arg);
+    Serial1.print(", ");
+    Serial1.println(targetStepCount);
   #endif
 
   noInterrupts();
@@ -243,13 +246,13 @@ void setMotorRPM()
   char* garbage = NULL;
   
   if(arg != NULL){
-    uint32_t motSpeed = (uint32_t) strtol(arg, &garbage,0);
+    uint32_t motSpeed = (uint32_t) strtol(arg,&garbage,0);
     if((motSpeed >= 1500 && motSpeed <= 6500) || motSpeed == 0){
       arg = cmd.next();
       if(arg != NULL){  
-        uint8_t motNum = (uint8_t) strtol(arg, &garbage,0);
+        uint8_t motNum = (uint8_t) strtol(arg,&garbage,0);
         motorArr[motNum]->targetRPM = motSpeed;
-        Serial.println(motorArr[motNum]->targetRPM);
+        Serial1.println(motorArr[motNum]->targetRPM);
         motorArr[motNum]->motorInstruction = true;
       }
     }
@@ -261,9 +264,22 @@ void getMotorRPM()
   char* arg = cmd.next();
   char* garbage = NULL;
   if(arg != NULL){
-    uint8_t motNum = (uint8_t) strtol(arg, &garbage,0);
+    uint8_t motNum = (uint8_t) strtol(arg,&garbage,0);
     if(motNum == 0 || motNum == 1)
-      Serial.println(motorArr[motNum]->inRPM);
+      Serial1.println(motorArr[motNum]->inRPM);
+  }
+}
+
+void setMotorSpeed()
+{
+  char* arg = cmd.next();
+  char* garbage = NULL;
+  if(arg != NULL){
+    uint8_t motSpeed = (uint8_t)strtol(arg,&garbage,0);
+    if(motSpeed > 0 && motSpeed < 255){
+      motorMaxSpeed = motSpeed;
+      Serial1.println(motorMaxSpeed);
+    }
   }
 }
 
@@ -280,9 +296,10 @@ void rotateMotor(){
     }
   }
 }
+
 void unknownCommand()
 {
-  Serial.println("Command not found");
+  Serial1.println("Command not found");
 }
 
 uint8_t update_crc8(uint8_t crc, uint8_t crc_seed)
